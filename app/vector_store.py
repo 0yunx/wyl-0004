@@ -53,13 +53,14 @@ class VectorStore:
 
         self.documents: Dict[str, Dict] = {}
         self.chunks: List[Dict] = []
-        self._row_to_idx: Dict[int, int] = {}
+        self._row_to_idx: Dict[int, List[int]] = {}
 
         self._vectors_mmap: Optional[np.memmap] = None
         self._dim: int = 0
         self._n_vectors: int = 0
         self._index: Optional[HNSWIndex] = None
         self._deleted_rows: set = set()
+        self._row_refcount: Dict[int, int] = {}
 
         self._load()
 
@@ -83,6 +84,9 @@ class VectorStore:
         self._dim = data.get("dim", 0)
         self._n_vectors = data.get("n_vectors", 0)
         self._deleted_rows = set(data.get("deleted_rows", []))
+        self._row_refcount = {
+            int(k): int(v) for k, v in data.get("row_refcount", {}).items()
+        }
         self._rebuild_row_index()
 
         if self._n_vectors > 0 and self._dim > 0 and os.path.exists(self._vectors_path):
@@ -105,6 +109,7 @@ class VectorStore:
             "dim": self._dim,
             "n_vectors": self._n_vectors,
             "deleted_rows": list(self._deleted_rows),
+            "row_refcount": self._row_refcount,
         }
         tmp = self._meta_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -121,12 +126,16 @@ class VectorStore:
         os.replace(tmp, self._index_path)
 
     def _rebuild_row_index(self) -> None:
-        """Rebuild the row_idx → chunks-list-position lookup dict."""
+        """Rebuild the row_idx → list-of-chunks-list-positions lookup dict.
+
+        One physical vector row can be referenced by multiple logical
+        chunks (from different documents that share cached embeddings).
+        """
         self._row_to_idx = {}
         for i, chunk in enumerate(self.chunks):
             row = chunk.get("row_idx")
             if row is not None:
-                self._row_to_idx[row] = i
+                self._row_to_idx.setdefault(row, []).append(i)
 
     # ── Vector I/O ───────────────────────────────────────────────────
 
@@ -273,6 +282,7 @@ class VectorStore:
         file_type: str,
         chunks_text: List[str],
         chunk_vectors: List[np.ndarray],
+        content_hash: str = None,
     ) -> str:
         """Ingest a new document: normalize, store, and index its chunks.
 
@@ -281,18 +291,23 @@ class VectorStore:
             file_type: ``'txt'`` or ``'pdf'``.
             chunks_text: Text of each chunk.
             chunk_vectors: Embedding vector for each chunk (raw, pre-normalization).
+            content_hash: Optional SHA-256 hex digest of the source text,
+                used by the deduplication layer to locate reusable vectors.
 
         Returns:
             The UUID assigned to the new document.
         """
         doc_id = str(uuid.uuid4())
 
-        self.documents[doc_id] = {
+        doc_meta = {
             "document_id": doc_id,
             "filename": filename,
             "file_type": file_type,
             "chunks_count": len(chunks_text),
         }
+        if content_hash is not None:
+            doc_meta["content_hash"] = content_hash
+        self.documents[doc_id] = doc_meta
 
         start_idx = self._append_vectors(np.stack(chunk_vectors))
 
@@ -309,7 +324,8 @@ class VectorStore:
                 "row_idx": row_idx,
                 "index": i,
             })
-            self._row_to_idx[row_idx] = len(self.chunks) - 1
+            self._row_to_idx.setdefault(row_idx, []).append(len(self.chunks) - 1)
+            self._row_refcount[row_idx] = self._row_refcount.get(row_idx, 0) + 1
 
             if self._index is not None:
                 self._index.insert(
@@ -318,6 +334,64 @@ class VectorStore:
 
         self._save_metadata()
         self._save_index()
+        return doc_id
+
+    def add_document_reusing_vectors(
+        self,
+        filename: str,
+        file_type: str,
+        chunks_text: List[str],
+        existing_row_indices: List[int],
+        content_hash: str = None,
+    ) -> str:
+        """Create a new document record whose chunks point to pre-existing vector rows.
+
+        Used when the deduplication cache hits: the vectors have already
+        been stored and indexed, so we skip both ``_append_vectors`` and
+        the HNSW ``insert`` calls and just link the new logical chunks
+        to the existing physical rows.
+
+        Args:
+            filename: Original upload file name.
+            file_type: ``'txt'`` or ``'pdf'``.
+            chunks_text: Text of each chunk (same order as *existing_row_indices*).
+            existing_row_indices: Row indices in ``vectors.bin`` to reuse.
+            content_hash: Optional SHA-256 hex digest of the source text.
+
+        Returns:
+            The UUID assigned to the new document.
+        """
+        assert len(chunks_text) == len(existing_row_indices), (
+            "chunks_text and existing_row_indices must have the same length"
+        )
+
+        doc_id = str(uuid.uuid4())
+
+        doc_meta = {
+            "document_id": doc_id,
+            "filename": filename,
+            "file_type": file_type,
+            "chunks_count": len(chunks_text),
+        }
+        if content_hash is not None:
+            doc_meta["content_hash"] = content_hash
+        self.documents[doc_id] = doc_meta
+
+        for i, (text, row_idx) in enumerate(zip(chunks_text, existing_row_indices)):
+            chunk_id = f"{doc_id}_{i}"
+
+            self.chunks.append({
+                "chunk_id": chunk_id,
+                "document_id": doc_id,
+                "filename": filename,
+                "content": text,
+                "row_idx": row_idx,
+                "index": i,
+            })
+            self._row_to_idx.setdefault(row_idx, []).append(len(self.chunks) - 1)
+            self._row_refcount[row_idx] = self._row_refcount.get(row_idx, 0) + 1
+
+        self._save_metadata()
         return doc_id
 
     def search(
@@ -374,9 +448,10 @@ class VectorStore:
             if row_idx in self._deleted_rows:
                 continue
             cos_sim = 1.0 - sq_dist / 2.0
-            pos = self._row_to_idx.get(row_idx)
-            if pos is not None:
-                results.append((self.chunks[pos].copy(), cos_sim))
+            positions = self._row_to_idx.get(row_idx)
+            if positions is not None:
+                for pos in positions:
+                    results.append((self.chunks[pos].copy(), cos_sim))
             if len(results) >= top_k:
                 break
 
@@ -400,9 +475,10 @@ class VectorStore:
             idx = int(idx)
             if idx in self._deleted_rows:
                 continue
-            pos = self._row_to_idx.get(idx)
-            if pos is not None:
-                results.append((self.chunks[pos].copy(), float(sims[idx])))
+            positions = self._row_to_idx.get(idx)
+            if positions is not None:
+                for pos in positions:
+                    results.append((self.chunks[pos].copy(), float(sims[idx])))
             if len(results) >= top_k:
                 break
 
@@ -416,12 +492,36 @@ class VectorStore:
         """Return a list of all stored document metadata dicts."""
         return list(self.documents.values())
 
+    def find_row_indices_by_hash(self, content_hash: str) -> Optional[List[int]]:
+        """Locate physical vector rows belonging to a document with *content_hash*.
+
+        Walks all stored documents to find one with a matching
+        ``content_hash`` and returns the row indices of its chunks in
+        order.  Returns ``None`` if no document with that hash exists or
+        the hash has never been stored.
+
+        Used by the deduplication layer to discover reusable vectors
+        that are already present in the store.
+        """
+        for doc_id, doc in self.documents.items():
+            if doc.get("content_hash") == content_hash:
+                rows = [
+                    c["row_idx"]
+                    for c in self.chunks
+                    if c["document_id"] == doc_id
+                ]
+                if rows:
+                    return rows
+        return None
+
     def delete_document(self, doc_id: str) -> bool:
         """Delete a document and its chunks.
 
-        Vectors are soft-deleted (added to ``_deleted_rows``) and the
-        HNSW entries are patched out.  If garbage exceeds 20 % of total
-        rows a full compaction is triggered to reclaim disk space.
+        Physical vector rows are reference-counted.  A row is only
+        soft-deleted (added to ``_deleted_rows``) when its refcount
+        drops to zero — i.e. when the last document referencing it is
+        removed.  If garbage exceeds 20 % of total rows a full
+        compaction is triggered to reclaim disk space.
 
         Returns:
             ``True`` if the document was found and deleted.
@@ -429,14 +529,19 @@ class VectorStore:
         if doc_id not in self.documents:
             return False
 
-        rows_to_delete = {
-            c["row_idx"] for c in self.chunks if c["document_id"] == doc_id
-        }
-        self._deleted_rows.update(rows_to_delete)
+        doc_rows = [c["row_idx"] for c in self.chunks if c["document_id"] == doc_id]
+        rows_to_delete: set = set()
+        for row_idx in doc_rows:
+            self._row_refcount[row_idx] = self._row_refcount.get(row_idx, 1) - 1
+            if self._row_refcount[row_idx] <= 0:
+                rows_to_delete.add(row_idx)
+                del self._row_refcount[row_idx]
 
-        if self._index is not None:
-            for row_idx in rows_to_delete:
-                self._index.remove(row_idx)
+        if rows_to_delete:
+            self._deleted_rows.update(rows_to_delete)
+            if self._index is not None:
+                for row_idx in rows_to_delete:
+                    self._index.remove(row_idx)
 
         del self.documents[doc_id]
         self.chunks = [c for c in self.chunks if c["document_id"] != doc_id]
@@ -455,6 +560,7 @@ class VectorStore:
         self.documents = {}
         self.chunks = []
         self._row_to_idx = {}
+        self._row_refcount = {}
         self._deleted_rows.clear()
         self._n_vectors = 0
         self._dim = 0

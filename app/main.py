@@ -33,6 +33,7 @@ from .chunker import TextChunker
 from .embedder import Embedder
 from .vector_store import VectorStore
 from .llm_client import LLMClient
+from .cache import DeduplicationCache
 
 app = FastAPI(
     title="RAG Knowledge Base API",
@@ -53,6 +54,7 @@ chunker = TextChunker()
 embedder = Embedder()
 vector_store = VectorStore()
 llm_client = LLMClient()
+dedupe_cache = DeduplicationCache()
 
 
 @app.get("/", tags=["Health"])
@@ -125,35 +127,77 @@ async def upload_document(file: UploadFile = File(...)):
             detail="No extractable text content found in the document",
         )
 
-    chunks_text = chunker.chunk(text)
+    content_hash = DeduplicationCache.compute_hash(text)
+    deduplicated = False
 
-    if not chunks_text:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Failed to create chunks from document content",
-        )
+    existing_rows = vector_store.find_row_indices_by_hash(content_hash)
 
-    try:
-        chunk_vectors = await embedder.embed_batch(chunks_text)
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to generate embeddings: {str(e)}",
-        )
+    if existing_rows is not None:
+        chunks_text_cache = dedupe_cache.lookup(text)
+        if chunks_text_cache is not None:
+            chunks_text, _ = chunks_text_cache
+            if len(chunks_text) == len(existing_rows):
+                doc_id = vector_store.add_document_reusing_vectors(
+                    filename=file.filename,
+                    file_type=file_type,
+                    chunks_text=chunks_text,
+                    existing_row_indices=existing_rows,
+                    content_hash=content_hash,
+                )
+                deduplicated = True
+                return DocumentUploadResponse(
+                    success=True,
+                    document_id=doc_id,
+                    filename=file.filename,
+                    chunks_count=len(chunks_text),
+                    deduplicated=True,
+                    message=f"Document uploaded successfully. Reused {len(chunks_text)} cached chunks (deduplicated).",
+                )
+
+    cache_hit = dedupe_cache.lookup(text)
+
+    if cache_hit is not None:
+        chunks_text, chunk_vectors = cache_hit
+        deduplicated = True
+    else:
+        chunks_text = chunker.chunk(text)
+
+        if not chunks_text:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Failed to create chunks from document content",
+            )
+
+        try:
+            chunk_vectors = await embedder.embed_batch(chunks_text)
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to generate embeddings: {str(e)}",
+            )
+
+        dedupe_cache.store(text, chunks_text, chunk_vectors)
 
     doc_id = vector_store.add_document(
         filename=file.filename,
         file_type=file_type,
         chunks_text=chunks_text,
         chunk_vectors=chunk_vectors,
+        content_hash=content_hash,
     )
+
+    if deduplicated:
+        msg = f"Document uploaded successfully. Reused {len(chunks_text)} cached chunks (deduplicated)."
+    else:
+        msg = f"Document uploaded successfully. Created {len(chunks_text)} chunks."
 
     return DocumentUploadResponse(
         success=True,
         document_id=doc_id,
         filename=file.filename,
         chunks_count=len(chunks_text),
-        message=f"Document uploaded successfully. Created {len(chunks_text)} chunks.",
+        deduplicated=deduplicated,
+        message=msg,
     )
 
 

@@ -46,6 +46,7 @@ class Settings:
     HNSW_EF_CONSTRUCTION: int = int(os.getenv("HNSW_EF_CONSTRUCTION", "200"))
     HNSW_EF: int = int(os.getenv("HNSW_EF", "50"))
     VECTOR_STORE_PATH: str = os.getenv("VECTOR_STORE_PATH", "./data/vector_store.json")
+    CACHE_DB_PATH: str = os.getenv("CACHE_DB_PATH", "./data/dedupe_cache.db")
     ALLOWED_EXTENSIONS: set = {".txt", ".pdf"}
     MAX_FILE_SIZE: int = 10 * 1024 * 1024
 

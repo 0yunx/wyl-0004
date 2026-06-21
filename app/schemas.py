@@ -15,6 +15,7 @@ class DocumentUploadResponse(BaseModel):
     document_id: str
     filename: str
     chunks_count: int
+    deduplicated: bool
     message: str
 
 
