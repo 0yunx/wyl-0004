@@ -443,15 +443,16 @@ class VectorStore:
         n_candidates = max(top_k * 3, top_k + len(self._deleted_rows) + 10)
         raw = self._index.search(query_normalized, n_candidates, self._vectors_mmap)
 
+        seen_rows: set = set()
         results: List[Tuple[Dict, float]] = []
         for sq_dist, row_idx in raw:
-            if row_idx in self._deleted_rows:
+            if row_idx in self._deleted_rows or row_idx in seen_rows:
                 continue
             cos_sim = 1.0 - sq_dist / 2.0
             positions = self._row_to_idx.get(row_idx)
-            if positions is not None:
-                for pos in positions:
-                    results.append((self.chunks[pos].copy(), cos_sim))
+            if positions is not None and positions:
+                seen_rows.add(row_idx)
+                results.append((self.chunks[positions[0]].copy(), cos_sim))
             if len(results) >= top_k:
                 break
 
@@ -470,15 +471,16 @@ class VectorStore:
         sims = (self._vectors_mmap @ q.T).flatten()
         top_indices = np.argsort(sims)[::-1][:top_k + len(self._deleted_rows)]
 
+        seen_rows: set = set()
         results: List[Tuple[Dict, float]] = []
         for idx in top_indices:
             idx = int(idx)
-            if idx in self._deleted_rows:
+            if idx in self._deleted_rows or idx in seen_rows:
                 continue
             positions = self._row_to_idx.get(idx)
-            if positions is not None:
-                for pos in positions:
-                    results.append((self.chunks[pos].copy(), float(sims[idx])))
+            if positions is not None and positions:
+                seen_rows.add(idx)
+                results.append((self.chunks[positions[0]].copy(), float(sims[idx])))
             if len(results) >= top_k:
                 break
 
