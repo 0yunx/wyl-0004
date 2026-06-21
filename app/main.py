@@ -1,3 +1,18 @@
+"""FastAPI application — RAG Knowledge Base Q&A API.
+
+Provides three core endpoints:
+
+- ``POST /api/documents/upload`` — ingest a PDF/TXT document
+- ``POST /api/search``         — vector similarity search
+- ``POST /api/chat``           — retrieval-augmented generation
+
+Plus CRUD helpers for document management and a health-check endpoint.
+
+All responses follow a uniform JSON envelope with a ``success`` boolean.
+On error, ``success`` is ``false`` and ``error`` / ``message`` fields
+describe the failure.
+"""
+
 import os
 from fastapi import FastAPI, UploadFile, File, HTTPException, status
 from fastapi.responses import JSONResponse
@@ -21,8 +36,8 @@ from .llm_client import LLMClient
 
 app = FastAPI(
     title="RAG Knowledge Base API",
-    description="基于 RAG 的个人知识库问答 API",
-    version="1.0.0",
+    description="基于 RAG 的个人知识库问答 API（手写分块 + HNSW 向量检索）",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -42,11 +57,13 @@ llm_client = LLMClient()
 
 @app.get("/", tags=["Health"])
 async def root():
+    """Root endpoint — confirm the API is running."""
     return {"message": "RAG Knowledge Base API is running", "status": "ok"}
 
 
 @app.get("/health", tags=["Health"])
 async def health_check():
+    """Health check — returns status and number of indexed documents."""
     return {"status": "healthy", "documents_count": len(vector_store.documents)}
 
 
@@ -60,6 +77,13 @@ async def health_check():
     tags=["Documents"],
 )
 async def upload_document(file: UploadFile = File(...)):
+    """Upload and index a PDF or TXT document.
+
+    Pipeline: validate → parse → chunk → embed → store → index (HNSW).
+
+    The file is validated for extension and size *before* any parsing
+    work begins so that non-text files (e.g. images) are rejected early.
+    """
     if not file.filename:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -135,6 +159,7 @@ async def upload_document(file: UploadFile = File(...)):
 
 @app.get("/api/documents", tags=["Documents"])
 async def list_documents():
+    """List all indexed documents with metadata."""
     return {
         "success": True,
         "documents": vector_store.list_documents(),
@@ -144,6 +169,11 @@ async def list_documents():
 
 @app.delete("/api/documents/{doc_id}", tags=["Documents"])
 async def delete_document(doc_id: str):
+    """Delete a document and all its chunks from the index.
+
+    Vectors are soft-deleted; physical compaction occurs automatically
+    when garbage exceeds 20 % of total rows.
+    """
     if not vector_store.get_document(doc_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -160,6 +190,11 @@ async def delete_document(doc_id: str):
     tags=["Search"],
 )
 async def search(query: SearchQuery):
+    """Semantic vector search over indexed document chunks.
+
+    Uses the HNSW index for O(log N) retrieval.  Returns the top-k
+    most similar chunks with their cosine-similarity scores.
+    """
     if not query.query.strip():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -177,17 +212,16 @@ async def search(query: SearchQuery):
     top_k = query.top_k or settings.TOP_K
     results = vector_store.search(query_vector, top_k)
 
-    search_results = []
-    for chunk, score in results:
-        search_results.append(
-            SearchResult(
-                chunk_id=chunk["chunk_id"],
-                document_id=chunk["document_id"],
-                filename=chunk["filename"],
-                content=chunk["content"],
-                similarity_score=score,
-            )
+    search_results = [
+        SearchResult(
+            chunk_id=chunk["chunk_id"],
+            document_id=chunk["document_id"],
+            filename=chunk["filename"],
+            content=chunk["content"],
+            similarity_score=score,
         )
+        for chunk, score in results
+    ]
 
     return SearchResponse(
         success=True,
@@ -203,6 +237,12 @@ async def search(query: SearchQuery):
     tags=["Chat"],
 )
 async def chat(query: ChatQuery):
+    """Retrieval-augmented generation: search → LLM answer.
+
+    1. Embed the query and retrieve the top-k chunks via HNSW.
+    2. Pass the chunks as context to the LLM.
+    3. Return the LLM's answer along with source citations.
+    """
     if not query.query.strip():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -220,17 +260,16 @@ async def chat(query: ChatQuery):
     top_k = query.top_k or settings.TOP_K
     results = vector_store.search(query_vector, top_k)
 
-    context_chunks = []
-    for chunk, score in results:
-        context_chunks.append(
-            SearchResult(
-                chunk_id=chunk["chunk_id"],
-                document_id=chunk["document_id"],
-                filename=chunk["filename"],
-                content=chunk["content"],
-                similarity_score=score,
-            )
+    context_chunks = [
+        SearchResult(
+            chunk_id=chunk["chunk_id"],
+            document_id=chunk["document_id"],
+            filename=chunk["filename"],
+            content=chunk["content"],
+            similarity_score=score,
         )
+        for chunk, score in results
+    ]
 
     try:
         answer = await llm_client.generate_answer(
@@ -255,6 +294,7 @@ async def chat(query: ChatQuery):
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc):
+    """Convert FastAPI HTTPExceptions into the uniform error envelope."""
     return JSONResponse(
         status_code=exc.status_code,
         content={
@@ -267,6 +307,7 @@ async def http_exception_handler(request, exc):
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request, exc):
+    """Catch-all handler — prevents stack traces from leaking in responses."""
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={
